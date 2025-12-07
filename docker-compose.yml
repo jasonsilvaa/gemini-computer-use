@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  gemini-computer-use:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gemini-computer-use
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - USE_VERTEXAI=${USE_VERTEXAI:-false}
+      - VERTEXAI_PROJECT=${VERTEXAI_PROJECT:-}
+      - VERTEXAI_LOCATION=${VERTEXAI_LOCATION:-}
+      # Variáveis opcionais para Browserbase
+      - BROWSERBASE_API_KEY=${BROWSERBASE_API_KEY:-}
+      - BROWSERBASE_PROJECT_ID=${BROWSERBASE_PROJECT_ID:-}
+    volumes:
+      # Montar código para desenvolvimento (opcional)
+      - .:/app
+      # Persistir dados do Playwright
+      - playwright-data:/ms-playwright
+    restart: unless-stopped
+    # Para usar display (X11) se necessário para modo headless=false
+    # Descomente se precisar de display gráfico
+    # network_mode: host
+    # environment:
+    #   - DISPLAY=${DISPLAY}
+
+volumes:
+  playwright-data:
+

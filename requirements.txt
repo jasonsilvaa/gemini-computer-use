@@ -5,3 +5,5 @@ playwright==1.55.0
 browserbase==1.4.0
 rich
 pytest
+Pillow>=10.0.0
+Flask>=2.0.0
