@@ -29,8 +29,14 @@ from io import BytesIO
 
 from agent import BrowserAgent
 from computers import BrowserbaseComputer, PlaywrightComputer, EnvState
+from logger_config import setup_logger, get_logger
 
 PLAYWRIGHT_SCREEN_SIZE = (1440, 900)
+
+# Configurar logging para Flask e aplicação
+setup_logger("gemini_computer_use", log_file="logs/app.log", detailed=True)
+logger = get_logger(__name__)
+flask_logger = get_logger("flask")
 
 app = Flask(__name__)
 
@@ -142,6 +148,7 @@ HTML_TEMPLATE = """
             display: flex;
             gap: 10px;
             margin-top: 20px;
+            flex-wrap: wrap;
         }
         button {
             flex: 1;
@@ -171,6 +178,18 @@ HTML_TEMPLATE = """
         .btn-secondary {
             background: #95a5a6;
             color: white;
+        }
+        .btn-secondary:hover:not(:disabled) {
+            background: #7f8c8d;
+        }
+        .btn-reload {
+            background: #3498db;
+            color: white;
+        }
+        .btn-reload:hover:not(:disabled) {
+            background: #2980b9;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(52, 152, 219, 0.4);
         }
         button:disabled {
             opacity: 0.6;
@@ -261,7 +280,22 @@ HTML_TEMPLATE = """
                 <form id="configForm">
                     <div class="form-group">
                         <label for="query">Query (Tarefa):</label>
-                        <textarea id="query" name="query" placeholder="Ex: Go to Google and type 'Hello World' into the search bar" required></textarea>
+                        <textarea id="query" name="query" placeholder="Ex: Navegue para github.com e faça login usando o email fornecido e a senha fornecida" required></textarea>
+                        <small style="color: #666; font-size: 12px; margin-top: 5px; display: block;">
+                            💡 Use "o email fornecido" e "a senha fornecida" ou {email} e {password} para usar credenciais do arquivo credentials.json
+                        </small>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="service">Serviço (para credenciais):</label>
+                        <select id="service" name="service">
+                            <option value="github">GitHub</option>
+                            <option value="google">Google</option>
+                            <option value="other">Outro</option>
+                        </select>
+                        <small style="color: #666; font-size: 12px; margin-top: 5px; display: block;">
+                            Selecione o serviço para carregar credenciais do arquivo credentials.json
+                        </small>
                     </div>
                     
                     <div class="form-group">
@@ -293,6 +327,7 @@ HTML_TEMPLATE = """
                         <button type="button" class="btn-primary" id="startBtn" onclick="startAgent()">▶ Iniciar</button>
                         <button type="button" class="btn-danger" id="stopBtn" onclick="stopAgent()" disabled>⏹ Parar</button>
                         <button type="button" class="btn-secondary" onclick="clearLogs()">🗑 Limpar</button>
+                        <button type="button" class="btn-reload" onclick="reloadPage()" title="Recarregar página">🔄 Recarregar</button>
                     </div>
                 </form>
             </div>
@@ -381,6 +416,7 @@ HTML_TEMPLATE = """
             const formData = new FormData(form);
             const data = Object.fromEntries(formData);
             data.highlight_mouse = document.getElementById('highlight_mouse').checked;
+            data.service = document.getElementById('service').value;
             
             fetch('/api/start', {
                 method: 'POST',
@@ -416,6 +452,12 @@ HTML_TEMPLATE = """
                 });
         }
         
+        function reloadPage() {
+            if (confirm('Deseja recarregar a página? Isso irá limpar todos os logs e resetar o estado.')) {
+                window.location.reload();
+            }
+        }
+        
         // Atualizar status, logs e screenshot periodicamente
         updateInterval = setInterval(() => {
             updateStatus();
@@ -437,15 +479,22 @@ class BrowserAgentWebWrapper(BrowserAgent):
     """Wrapper do BrowserAgent para interface web"""
     
     def __init__(self, browser_computer, query, model_name, state):
+        logger.info(f"Inicializando BrowserAgentWebWrapper - Query: {query[:100]}...")
+        logger.debug(f"Modelo: {model_name}")
         super().__init__(browser_computer, query, model_name, verbose=False)
         self.state = state
+        self._original_query = query  # Armazenar query original para referência
+        logger.info("BrowserAgentWebWrapper inicializado com sucesso")
         
     def handle_action(self, action):
         """Override para capturar screenshots"""
+        logger.debug(f"BrowserAgentWebWrapper.handle_action: {action.name}")
         result = super().handle_action(action)
         
         if isinstance(result, EnvState):
             # Adicionar screenshot à fila
+            screenshot_size = len(result.screenshot)
+            logger.debug(f"Screenshot capturada: {screenshot_size} bytes, URL: {result.url}")
             self.state['screenshot_queue'].put(result.screenshot)
             self.state['current_url'] = result.url
             self._log(f"Ação executada: {action.name}", "info")
@@ -466,6 +515,10 @@ class BrowserAgentWebWrapper(BrowserAgent):
         # Manter apenas os últimos 1000 logs
         if len(self.state['logs']) > 1000:
             self.state['logs'] = self.state['logs'][-1000:]
+        
+        # Também logar no sistema de logging
+        log_func = getattr(logger, level, logger.info)
+        log_func(f"[WebGUI] {message}")
             
     def run_one_iteration(self):
         """Override para capturar logs"""
@@ -479,7 +532,89 @@ class BrowserAgentWebWrapper(BrowserAgent):
             return "COMPLETE"
             
         if not response.candidates:
-            self._log("Resposta sem candidatos!", "error")
+            error_details = []
+            is_safety_block = False
+            
+            error_details.append("ERRO: Resposta sem candidatos da API do Gemini!")
+            
+            # Tentar obter mais informações
+            try:
+                if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
+                    feedback = response.prompt_feedback
+                    error_details.append(f"Prompt feedback: {feedback}")
+                    
+                    # Verificar bloqueio de segurança
+                    if hasattr(feedback, 'block_reason') and feedback.block_reason:
+                        is_safety_block = True
+                        block_reason = feedback.block_reason
+                        block_message = getattr(feedback, 'block_reason_message', None)
+                        
+                        error_details.append("")
+                        error_details.append("=" * 60)
+                        error_details.append("🚫 BLOQUEIO DE SEGURANÇA DETECTADO")
+                        error_details.append("=" * 60)
+                        error_details.append("")
+                        error_details.append(f"📝 Query atual:")
+                        error_details.append(f"   {self._original_query}")
+                        error_details.append("")
+                        error_details.append(f"⚠️  Razão do bloqueio: {block_reason}")
+                        if block_message:
+                            error_details.append(f"📄 Mensagem: {block_message}")
+                        
+                        # Verificar safety ratings se disponível
+                        if hasattr(feedback, 'safety_ratings') and feedback.safety_ratings:
+                            error_details.append("")
+                            error_details.append("🔍 Safety Ratings:")
+                            for rating in feedback.safety_ratings:
+                                error_details.append(f"   - {rating.category}: {rating.probability}")
+                        
+                        error_details.append("")
+                        error_details.append("💡 Como resolver:")
+                        error_details.append("")
+                        error_details.append("1. Reformule a query de forma mais clara e específica")
+                        error_details.append("   Exemplo: Em vez de 'delete files', use 'navigate to settings'")
+                        error_details.append("")
+                        error_details.append("2. Evite termos que possam ser interpretados como:")
+                        error_details.append("   - Destrutivos (delete, remove, destroy)")
+                        error_details.append("   - Maliciosos (hack, bypass, exploit)")
+                        error_details.append("   - Enganosos (fake, trick, deceive)")
+                        error_details.append("")
+                        error_details.append("3. Divida tarefas complexas em etapas menores")
+                        error_details.append("   Exemplo: 'Login' → 'Navigate to page' → 'Fill form'")
+                        error_details.append("")
+                        error_details.append("4. Use linguagem descritiva e específica")
+                        error_details.append("   Exemplo: 'Click the blue button in the top right'")
+                        error_details.append("")
+                        error_details.append("=" * 60)
+                
+                if hasattr(response, 'usage_metadata') and response.usage_metadata:
+                    usage = response.usage_metadata
+                    if hasattr(usage, 'prompt_token_count'):
+                        error_details.append(f"Tokens usados: {usage.prompt_token_count}")
+            except Exception as e:
+                error_details.append(f"Erro ao obter detalhes: {e}")
+            
+            if not is_safety_block:
+                error_details.append("")
+                error_details.append("Possíveis causas:")
+                error_details.append("  - API Key inválida ou expirada")
+                error_details.append("  - Rate limiting ou quota excedida")
+                error_details.append("  - Filtros de segurança")
+                error_details.append("  - Problemas com o modelo")
+            
+            for detail in error_details:
+                self._log(detail, "error")
+            
+            logger.error("Resposta sem candidatos - detalhes completos:", exc_info=True)
+            
+            # Se for bloqueio de segurança, parar imediatamente
+            if is_safety_block:
+                self._log("", "error")
+                self._log("🛑 Bloqueio de segurança - agente parado", "error")
+                self._log(f"Query: {self._original_query}", "error")
+                self._log("Por favor, reformule a query e tente novamente", "error")
+                return "COMPLETE"
+            
             return "COMPLETE"
             
         candidate = response.candidates[0]
@@ -603,7 +738,13 @@ class BrowserAgentWebWrapper(BrowserAgent):
 
 def run_agent_thread(config, state):
     """Executa o agente em uma thread separada"""
+    thread_logger = get_logger("agent_thread")
+    
     try:
+        thread_logger.info("=" * 60)
+        thread_logger.info("Thread do agente iniciada")
+        thread_logger.info("=" * 60)
+        
         state['is_running'] = True
         state['status'] = 'Executando...'
         
@@ -613,41 +754,77 @@ def run_agent_thread(config, state):
         model_name = config.get('model', 'gemini-2.5-computer-use-preview-10-2025')
         query = config.get('query', '')
         
+        # Carregar e aplicar credenciais se disponíveis
+        try:
+            from credentials_loader import format_query
+            service = config.get('service', 'github')  # Padrão: github
+            original_query = query
+            query = format_query(query, service)
+            if query != original_query:
+                thread_logger.info("Credenciais aplicadas à query")
+        except Exception as e:
+            thread_logger.warning(f"Não foi possível carregar credenciais: {e}")
+            # Continuar sem credenciais
+        
+        thread_logger.info(f"Configuração do agente:")
+        thread_logger.info(f"  - Ambiente: {env_name}")
+        thread_logger.info(f"  - URL inicial: {initial_url}")
+        thread_logger.info(f"  - Highlight mouse: {highlight_mouse}")
+        thread_logger.info(f"  - Modelo: {model_name}")
+        thread_logger.info(f"  - Query: {query[:200]}..." if len(query) > 200 else f"  - Query: {query}")
+        
         # Criar ambiente
+        thread_logger.info(f"Criando ambiente {env_name}...")
         if env_name == "playwright":
             env = PlaywrightComputer(
                 screen_size=PLAYWRIGHT_SCREEN_SIZE,
                 initial_url=initial_url,
                 highlight_mouse=highlight_mouse,
             )
+            thread_logger.info("PlaywrightComputer criado")
         elif env_name == "browserbase":
             env = BrowserbaseComputer(
                 screen_size=PLAYWRIGHT_SCREEN_SIZE,
                 initial_url=initial_url
             )
+            thread_logger.info("BrowserbaseComputer criado")
         else:
-            raise ValueError(f"Ambiente desconhecido: {env_name}")
+            error_msg = f"Ambiente desconhecido: {env_name}"
+            thread_logger.error(error_msg)
+            raise ValueError(error_msg)
         
         # Criar agente
+        thread_logger.info("Iniciando contexto do ambiente...")
         with env as browser_computer:
+            thread_logger.info("Ambiente iniciado com sucesso")
+            thread_logger.info(f"Tamanho da tela: {browser_computer.screen_size()}")
+            
             agent = BrowserAgentWebWrapper(
                 browser_computer=browser_computer,
                 query=query,
                 model_name=model_name,
                 state=state
             )
+            thread_logger.info("Agente criado - iniciando loop...")
+            
             agent.agent_loop()
+            
+            thread_logger.info("Loop do agente finalizado")
             
         state['status'] = 'Concluído'
         state['is_running'] = False
+        thread_logger.info("Thread do agente finalizada com sucesso")
         
     except Exception as e:
+        thread_logger.error(f"Erro na thread do agente: {str(e)}", exc_info=True)
         state['status'] = f'Erro: {str(e)}'
         state['is_running'] = False
         import traceback
+        error_trace = traceback.format_exc()
+        thread_logger.error(f"Traceback completo:\n{error_trace}")
         state['log_queue'].put({
             'timestamp': time.strftime("%H:%M:%S"),
-            'message': f"Erro: {str(e)}\n{traceback.format_exc()}",
+            'message': f"Erro: {str(e)}\n{error_trace}",
             'level': 'error'
         })
 
@@ -655,6 +832,7 @@ def run_agent_thread(config, state):
 @app.route('/')
 def index():
     """Página principal"""
+    logger.info("Requisição para página principal")
     return render_template_string(HTML_TEMPLATE)
 
 
@@ -705,19 +883,28 @@ def get_screenshot():
 @app.route('/api/start', methods=['POST'])
 def start_agent():
     """Iniciar agente"""
+    logger.info("Requisição para iniciar agente")
+    
     if agent_state['is_running']:
+        logger.warning("Tentativa de iniciar agente que já está em execução")
         return jsonify({'success': False, 'error': 'Agente já está em execução'})
     
     config = request.json
+    logger.debug(f"Configuração recebida: {config}")
+    
     if not config.get('query'):
+        logger.warning("Tentativa de iniciar agente sem query")
         return jsonify({'success': False, 'error': 'Query é obrigatória'})
     
     # Limpar estado anterior
+    logger.info("Limpando estado anterior do agente")
     agent_state['logs'] = []
     agent_state['latest_screenshot'] = None
     agent_state['current_url'] = None
+    agent_state['current_query'] = config.get('query')  # Armazenar query atual
     
     # Iniciar thread
+    logger.info("Iniciando thread do agente")
     thread = threading.Thread(
         target=run_agent_thread,
         args=(config, agent_state),
@@ -725,6 +912,7 @@ def start_agent():
     )
     thread.start()
     agent_state['agent_thread'] = thread
+    logger.info("Thread do agente iniciada com sucesso")
     
     return jsonify({'success': True})
 
@@ -746,8 +934,20 @@ def clear_logs():
 
 if __name__ == '__main__':
     import sys
+    
+    # Criar diretório de logs se não existir
+    os.makedirs("logs", exist_ok=True)
+    
     # Permitir especificar porta via argumento ou usar 8080 como padrão
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
+    
+    logger.info("=" * 60)
+    logger.info("Gemini Computer Use - Interface Web")
+    logger.info("=" * 60)
+    logger.info(f"Iniciando servidor Flask na porta {port}")
+    logger.info(f"Acesse em: http://localhost:{port}")
+    logger.info("Pressione Ctrl+C para parar o servidor")
+    logger.info("=" * 60)
     
     print("=" * 60)
     print("Gemini Computer Use - Interface Web")
@@ -755,5 +955,6 @@ if __name__ == '__main__':
     print(f"Acesse em: http://localhost:{port}")
     print("Pressione Ctrl+C para parar o servidor")
     print("=" * 60)
+    
     app.run(host='0.0.0.0', port=port, debug=False)
 

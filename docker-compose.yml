@@ -12,12 +12,13 @@ services:
       - .env
     environment:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - USE_VERTEXAI=${USE_VERTEXAI:-false}
-      - VERTEXAI_PROJECT=${VERTEXAI_PROJECT:-}
-      - VERTEXAI_LOCATION=${VERTEXAI_LOCATION:-}
+      # USE_VERTEXAI, VERTEXAI_PROJECT e VERTEXAI_LOCATION são lidos do .env
+      # Não definir aqui para evitar conflitos
       # Variáveis opcionais para Browserbase
       - BROWSERBASE_API_KEY=${BROWSERBASE_API_KEY:-}
       - BROWSERBASE_PROJECT_ID=${BROWSERBASE_PROJECT_ID:-}
+      # Playwright headless mode (necessário no Docker)
+      - PLAYWRIGHT_HEADLESS=true
     volumes:
       # Montar código para desenvolvimento (opcional)
       - .:/app

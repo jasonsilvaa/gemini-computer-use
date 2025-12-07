@@ -51,6 +51,9 @@ RUN mkdir -p /app/logs
 ENV PYTHONUNBUFFERED=1
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
+# Criar diretório para navegadores e copiar se necessário
+RUN mkdir -p /ms-playwright
+
 # Expor porta padrão da interface web
 EXPOSE 8080
 

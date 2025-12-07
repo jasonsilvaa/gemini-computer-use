@@ -24,6 +24,16 @@ import playwright.sync_api
 from playwright.sync_api import sync_playwright
 from typing import Literal
 
+# Importar logger configurado
+try:
+    from logger_config import get_logger
+    logger = get_logger(__name__)
+except ImportError:
+    # Fallback se logger_config não estiver disponível
+    logger = logging.getLogger(__name__)
+    if not logger.handlers:
+        logging.basicConfig(level=logging.INFO)
+
 # Define a mapping from the user-friendly key names to Playwright's expected key names.
 # Playwright is generally good with case-insensitivity for these, but it's best to be canonical.
 # See: https://playwright.dev/docs/api/class-keyboard#keyboard-press
@@ -82,6 +92,11 @@ class PlaywrightComputer(Computer):
         search_engine_url: str = "https://www.google.com",
         highlight_mouse: bool = False,
     ):
+        logger.info(f"Inicializando PlaywrightComputer")
+        logger.debug(f"Screen size: {screen_size}")
+        logger.debug(f"URL inicial: {initial_url}")
+        logger.debug(f"Highlight mouse: {highlight_mouse}")
+        
         self._initial_url = initial_url
         self._screen_size = screen_size
         self._search_engine_url = search_engine_url
@@ -98,8 +113,16 @@ class PlaywrightComputer(Computer):
         self._page.goto(new_url)
 
     def __enter__(self):
-        print("Creating session...")
+        logger.info("Criando sessão do Playwright...")
+        start_time = time.time()
+        
+        logger.debug("Iniciando Playwright...")
         self._playwright = sync_playwright().start()
+        logger.debug("Playwright iniciado")
+        
+        headless = os.environ.get("PLAYWRIGHT_HEADLESS", "true").lower() in ("true", "1", "yes")
+        logger.info(f"Lançando navegador Chromium (headless={headless})...")
+        
         self._browser = self._playwright.chromium.launch(
             args=[
                 "--disable-extensions",
@@ -111,19 +134,33 @@ class PlaywrightComputer(Computer):
                 "--disable-sync",
                 # No '--no-sandbox' arg means the sandbox is on.
             ],
-            headless=bool(os.environ.get("PLAYWRIGHT_HEADLESS", False)),
+            headless=headless,
         )
+        logger.info("Navegador Chromium lançado com sucesso")
+        
+        logger.debug(f"Criando contexto do navegador com viewport: {self._screen_size}")
         self._context = self._browser.new_context(
             viewport={
                 "width": self._screen_size[0],
                 "height": self._screen_size[1],
             }
         )
+        logger.debug("Contexto criado")
+        
+        logger.debug("Criando nova página...")
         self._page = self._context.new_page()
+        logger.debug("Página criada")
+        
+        logger.info(f"Navegando para URL inicial: {self._initial_url}")
         self._page.goto(self._initial_url)
+        logger.info(f"Página carregada: {self._page.url}")
 
         self._context.on("page", self._handle_new_page)
+        logger.debug("Handler de novas páginas configurado")
 
+        elapsed = time.time() - start_time
+        logger.info(f"Sessão do Playwright criada em {elapsed:.2f}s")
+        
         termcolor.cprint(
             f"Started local playwright.",
             color="green",
@@ -132,28 +169,43 @@ class PlaywrightComputer(Computer):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        logger.info("Encerrando sessão do Playwright...")
+        
+        if exc_type:
+            logger.warning(f"Exceção detectada no contexto: {exc_type.__name__}: {exc_val}")
+        
         if self._context:
+            logger.debug("Fechando contexto do navegador...")
             self._context.close()
+            logger.debug("Contexto fechado")
+            
         try:
+            logger.debug("Fechando navegador...")
             self._browser.close()
+            logger.debug("Navegador fechado")
         except Exception as e:
             # Browser was already shut down because of SIGINT or such.
-            if "Browser.close: Connection closed while reading from the driver" in str(
-                e
-            ):
+            if "Browser.close: Connection closed while reading from the driver" in str(e):
+                logger.debug("Navegador já estava fechado")
                 pass
             else:
+                logger.error(f"Erro ao fechar navegador: {e}")
                 raise
 
+        logger.debug("Parando Playwright...")
         self._playwright.stop()
+        logger.info("Sessão do Playwright encerrada")
 
     def open_web_browser(self) -> EnvState:
         return self.current_state()
 
     def click_at(self, x: int, y: int):
+        logger.debug(f"Clique em coordenadas: ({x}, {y})")
         self.highlight_mouse(x, y)
         self._page.mouse.click(x, y)
+        logger.debug("Aguardando estado de carregamento...")
         self._page.wait_for_load_state()
+        logger.debug("Estado de carregamento alcançado")
         return self.current_state()
 
     def hover_at(self, x: int, y: int):
@@ -263,11 +315,20 @@ class PlaywrightComputer(Computer):
         return self.navigate(self._search_engine_url)
 
     def navigate(self, url: str) -> EnvState:
+        logger.info(f"Navegando para URL: {url}")
         normalized_url = url
         if not normalized_url.startswith(("http://", "https://")):
             normalized_url = "https://" + normalized_url
+            logger.debug(f"URL normalizada: {normalized_url}")
+        
+        start_time = time.time()
         self._page.goto(normalized_url)
+        elapsed = time.time() - start_time
+        logger.info(f"Navegação concluída em {elapsed:.2f}s")
+        
+        logger.debug("Aguardando estado de carregamento...")
         self._page.wait_for_load_state()
+        logger.debug(f"URL atual após navegação: {self._page.url}")
         return self.current_state()
 
     def key_combination(self, keys: list[str]) -> EnvState:
@@ -300,12 +361,21 @@ class PlaywrightComputer(Computer):
         return self.current_state()
 
     def current_state(self) -> EnvState:
+        logger.debug("Obtendo estado atual da página...")
         self._page.wait_for_load_state()
         # Even if Playwright reports the page as loaded, it may not be so.
         # Add a manual sleep to make sure the page has finished rendering.
         time.sleep(0.5)
+        
+        screenshot_start = time.time()
         screenshot_bytes = self._page.screenshot(type="png", full_page=False)
-        return EnvState(screenshot=screenshot_bytes, url=self._page.url)
+        screenshot_time = time.time() - screenshot_start
+        
+        current_url = self._page.url
+        logger.debug(f"Screenshot capturada em {screenshot_time:.2f}s ({len(screenshot_bytes)} bytes)")
+        logger.debug(f"URL atual: {current_url}")
+        
+        return EnvState(screenshot=screenshot_bytes, url=current_url)
 
     def screen_size(self) -> tuple[int, int]:
         viewport_size = self._page.viewport_size
